@@ -66,6 +66,13 @@ dev = [
     "sisypy @ git+https://github.com/peteromallet/sisypy.git@dfb3fa3",
 ]
 
+# Optional shared contract binding.  The qualified wheel is resolved through
+# the normal configured wheelhouse/private index; the generated Runtime client
+# remains the default transport when this extra is not installed.
+herzchen = [
+    "herzchen-contracts==0.1.0",
+]
+
 # Requires a configured private package index (e.g. local wheelhouse or git
 # source) because runpod-lifecycle is not published on public PyPI.
 # Install: pip install 'astrid[runpod]'
