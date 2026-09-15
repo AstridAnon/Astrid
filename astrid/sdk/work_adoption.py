@@ -28,9 +28,14 @@ class SharedWorkError(ValueError):
 try:  # The Astrid standalone distribution remains importable without FND.
     from herzchen.contracts import ResourceRef
     from herzchen.packs.authoring import ManagedPack
-    from herzchen.packs.templates import WorkProtocol, WorkTemplate, render_template
+    from herzchen.packs.templates import (
+        WorkProtocol,
+        WorkTemplate,
+        blank_project_template,
+        render_template,
+    )
 except ImportError as exc:  # pragma: no cover - exercised by standalone installs
-    ResourceRef = ManagedPack = WorkProtocol = WorkTemplate = None  # type: ignore[assignment]
+    ResourceRef = ManagedPack = WorkProtocol = WorkTemplate = blank_project_template = None  # type: ignore[assignment]
     render_template = None  # type: ignore[assignment]
     _IMPORT_ERROR: BaseException | None = exc
 else:
@@ -74,6 +79,35 @@ def _local_id(node: Mapping[str, Any], index: int) -> str:
     return value
 
 
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _record_kind(value: Any) -> str:
+    kind = _field(value, "kind", "")
+    return str(getattr(kind, "value", kind)).removeprefix("work.")
+
+
+def _record_payload(value: Any) -> Mapping[str, Any]:
+    payload = _field(value, "payload", {})
+    if not isinstance(payload, Mapping):
+        raise SharedWorkError("public template engine returned a record without a payload")
+    return payload
+
+
+def _runtime_request_key(value: str, suffix: str) -> str:
+    candidate = f"{value}-{suffix}"
+    if candidate and candidate[0].isalnum() and all(
+        character.isalnum() or character in "._~-" for character in candidate
+    ) and len(candidate) <= 256:
+        return candidate
+    import hashlib
+
+    return "astrid-work-" + hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class TemplateAdmission:
     """The Runtime receipts for tasks expanded from one shared template."""
@@ -82,6 +116,7 @@ class TemplateAdmission:
     template_ref: Mapping[str, Any]
     rendered: Any
     tasks: tuple[Mapping[str, Any], ...]
+    template_result: Any = None
 
 
 @dataclass(frozen=True)
@@ -99,13 +134,36 @@ class PackRevision:
 class RuntimeSharedWorkAdapter:
     """Use shared Herzchen resources while Runtime remains the only writer."""
 
-    def __init__(self, transport: Any, *, managed_pack_handler: Any = None, managed_pack_actor: Any = None) -> None:
+    def __init__(
+        self,
+        transport: Any,
+        *,
+        managed_pack_handler: Any = None,
+        managed_pack_actor: Any = None,
+        template_engine: Any = None,
+    ) -> None:
         if transport is None:
             raise TypeError("transport is required")
         self.transport = transport
         self.managed_pack_handler = managed_pack_handler
         self.managed_pack_actor = managed_pack_actor
+        self.template_engine = template_engine
         _require_shared()
+
+    def _require_template_engine(self) -> Any:
+        if self.template_engine is None:
+            raise SharedWorkUnavailable(
+                "Runtime must supply the public TemplateEngine owner seam"
+            )
+        return self.template_engine
+
+    def _template_project_ref(self, project_id: str) -> Any:
+        engine = self._require_template_engine()
+        reader = getattr(engine, "reader", None)
+        authority = getattr(reader, "authority", None)
+        if not isinstance(authority, str) or not authority:
+            raise SharedWorkUnavailable("public TemplateEngine did not expose its Runtime authority")
+        return ResourceRef(authority, "work.project", project_id)
 
     def _require_managed_pack_handler(self) -> Any:
         handler = self.managed_pack_handler
@@ -171,39 +229,59 @@ class RuntimeSharedWorkAdapter:
         canonical_project_id = str(project.get("project_id", project.get("id", "")))
         if canonical_project_id != project_id:
             raise SharedWorkError("Runtime returned a different project identity")
-        rendered = self.render(template, parameters)
+        engine = self._require_template_engine()
+        result = engine.instantiate_bundle(
+            template,
+            parameters,
+            project=self._template_project_ref(project_id),
+            logical_request_key=logical_request_key,
+        )
+        rendered = _field(result, "rendered")
+        if rendered is None:
+            raise SharedWorkError("public TemplateEngine returned no rendered template")
+        records = tuple(_field(result, "records", ()) or ())
+        task_records = tuple(record for record in records if _record_kind(record) == "task")
+        if not task_records:
+            raise SharedWorkError("shared template contains no task records")
         nodes = _task_nodes(rendered.seed)
-        if not nodes:
-            raise SharedWorkError("shared template contains no task nodes")
+        node_by_local = {_local_id(node, index): node for index, node in enumerate(nodes)}
 
         admissions: list[Mapping[str, Any]] = []
         template_ref = rendered.template.ref.to_dict()
-        for index, node in enumerate(nodes):
-            local_id = _local_id(node, index)
-            fields = dict(node.get("fields") or {})
-            capability = node.get("capability_id", fields.pop("capability_id", None))
+        for index, record in enumerate(task_records):
+            payload = _record_payload(record)
+            fields = dict(payload.get("fields") or {})
+            origin = fields.get("template_origin")
+            local_id = origin.get("local_id") if isinstance(origin, Mapping) else None
+            if not isinstance(local_id, str) or not local_id:
+                raise SharedWorkError("public template engine returned a task without local identity")
+            node = node_by_local.get(local_id)
+            if node is None:
+                raise SharedWorkError(f"public template engine returned an unknown task local_id: {local_id!r}")
+            capability = fields.get("capability_id")
             if not isinstance(capability, str) or not capability:
                 raise SharedWorkError(f"task {local_id!r} does not declare a Runtime capability_id")
-            input_ids = node.get("input_object_ids", fields.pop("input_object_ids", []))
+            input_ids = fields.get("input_object_ids", [])
             if not isinstance(input_ids, list) or any(not isinstance(item, str) for item in input_ids):
                 raise SharedWorkError(f"task {local_id!r} input_object_ids must be a list of strings")
-            spec = dict(node.get("spec") or fields.pop("spec", {}) or {})
+            spec = dict(fields.get("spec") or {})
             spec["template_origin"] = template_ref
             spec["template_local_id"] = local_id
             spec["template_parameters"] = dict(rendered.parameters)
-            digest = node.get("capability_digest", fields.pop("capability_digest", None))
-            if digest is None:
-                digest = spec.get("capability_digest")
+            record_ref = _field(record, "ref")
+            if isinstance(record_ref, ResourceRef):
+                spec["shared_work_ref"] = record_ref.to_dict()
+            digest = fields.get("capability_digest") or spec.get("capability_digest")
             if not isinstance(digest, str) or not digest:
                 raise SharedWorkError(f"task {local_id!r} must declare the admitted capability digest")
-            effect = node.get("settlement_effect", fields.pop("settlement_effect", None))
-            storage = node.get("storage_estimate", fields.pop("storage_estimate", None))
-            generation_intent = node.get("generation_intent", fields.pop("generation_intent", None))
+            effect = fields.get("settlement_effect")
+            storage = fields.get("storage_estimate")
+            generation_intent = fields.get("generation_intent")
             response = self.transport.admit_task(
                 capability_id=capability,
                 capability_digest=digest,
                 input_object_ids=list(input_ids),
-                idempotency_key=f"{logical_request_key}:{local_id}",
+                idempotency_key=_runtime_request_key(logical_request_key, local_id),
                 project_id=project_id,
                 spec=spec,
                 settlement_effect=effect,
@@ -218,7 +296,26 @@ class RuntimeSharedWorkAdapter:
             if isinstance(admission.get("task"), Mapping):
                 admission = admission["task"]
             admissions.append(admission)
-        return TemplateAdmission(project_id, template_ref, rendered, tuple(admissions))
+        return TemplateAdmission(project_id, template_ref, rendered, tuple(admissions), result)
+
+    def instantiate_blank_project(
+        self,
+        parameters: Mapping[str, Any] | None = None,
+        *,
+        project_id: str,
+        logical_request_key: str,
+    ) -> Any:
+        """Exercise the shared built-in blank path for an existing Runtime project."""
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise SharedWorkError("project_id is required")
+        if not isinstance(logical_request_key, str) or not logical_request_key.strip():
+            raise SharedWorkError("logical_request_key is required")
+        return self._require_template_engine().instantiate_bundle(
+            blank_project_template(),
+            parameters,
+            project=self._template_project_ref(project_id),
+            logical_request_key=logical_request_key,
+        )
 
     def adopt_protocol(
         self,

@@ -84,10 +84,8 @@ def _canonical_pack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return pack
 
 
-def _cpu_render_pack(tmp_path: Path) -> tuple[Path, bytes]:
+def _cpu_render_pack(tmp_path: Path) -> Path:
     """Create a deterministic, offline CPU renderer for GenericPackHost."""
-    output = b"P6\n2 2\n255\n\xff\x00\x00\x00\xff\x00\x00\x00\xff\xff\xff\xff"
-    output_digest = _digest(output)
     root = tmp_path / "ast05-cpu-render-pack"
     root.mkdir()
     (root / "executor.yaml").write_text(
@@ -104,15 +102,23 @@ def _cpu_render_pack(tmp_path: Path) -> tuple[Path, bytes]:
                         "-c",
                         (
                             "from pathlib import Path; import hashlib, json; "
-                            "data=" + repr(output) + "; out=Path('{out}'); "
+                            "source=Path('{pack_snapshot}').read_bytes(); "
+                            "data=b'AST05-PINNED-SOURCE\\n'+hashlib.sha256(source).hexdigest().encode()+b'\\n'; "
+                            "out=Path('{out}'); "
                             "path=out/'render.ppm'; path.write_bytes(data); "
                             "(out/'manifest.json').write_text(json.dumps({'outputs': "
-                            "[{'name':'result','path':'render.ppm','content_hash':'"
-                            + output_digest
-                            + "','bytes':len(data),'ordinal':0,'is_primary':True,'role':'result'}]}))"
+                            "[{'name':'result','path':'render.ppm','content_hash':'sha256:'+hashlib.sha256(data).hexdigest(),'bytes':len(data),'ordinal':0,'is_primary':True,'role':'result'}]}))"
                         ),
                     ]
                 },
+                "inputs": [
+                    {
+                        "name": "pack_snapshot",
+                        "type": "file",
+                        "required": True,
+                        "description": "Runtime-materialized pinned pack resource",
+                    }
+                ],
                 "outputs": [
                     {
                         "name": "result",
@@ -126,7 +132,7 @@ def _cpu_render_pack(tmp_path: Path) -> tuple[Path, bytes]:
         ),
         encoding="utf-8",
     )
-    return root, output
+    return root
 
 
 def test_shared_template_pack_authoring_and_cpu_attempt_use_runtime_only(
@@ -147,6 +153,7 @@ def test_shared_template_pack_authoring_and_cpu_attempt_use_runtime_only(
             client,
             managed_pack_handler=bridge.managed_packs,
             managed_pack_actor=bridge.actor,
+            template_engine=bridge.template_engine,
         )
         project = _data(
             client.create_project(
@@ -162,7 +169,7 @@ def test_shared_template_pack_authoring_and_cpu_attempt_use_runtime_only(
         project = adapter.adopt_protocol(project_id, protocol, logical_request_key="ast05-protocol")
         assert project["metadata"]["shared_work"]["protocol_ref"]["id"] == protocol.id
 
-        cpu_pack, cpu_output = _cpu_render_pack(tmp_path)
+        cpu_pack = _cpu_render_pack(tmp_path)
         cpu_record = GenericPackHost(pack_roots=[cpu_pack]).discover()[0]
         client.register_capability(
             CAPABILITY,
@@ -176,6 +183,31 @@ def test_shared_template_pack_authoring_and_cpu_attempt_use_runtime_only(
         assert adopted.revision == "rev-1"
         assert pinned["revision"] == "rev-1"
         assert pinned["resource_digests"]["skill/SKILL.md"]
+        prior = bridge.managed_packs.read(pack.pack_id, revision="rev-1")
+        prior_skill = base64.b64decode(prior["resources"]["skill/SKILL.md"]["content_b64"])
+        source_object = _data(
+            client.ingest_project_object(
+                project_id,
+                prior_skill,
+                media_type="text/markdown",
+                filename="skill-SKILL.md",
+                idempotency_key="ast05-pack-source-rev1",
+            )
+        )
+        source_digest = str(source_object.get("digest", source_object.get("object_id", "")))
+        assert source_digest == _digest(prior_skill)
+        assert source_digest.removeprefix("sha256:") == pinned["resource_digests"]["skill/SKILL.md"]
+
+        blank = adapter.instantiate_blank_project(
+            {"title": "AST05 blank starter"},
+            project_id=project_id,
+            logical_request_key="ast05-blank-starter",
+        )
+        assert blank.project.ref.kind == "work.project"
+        assert blank.project.ref.id == project_id
+        assert blank.records == ()
+        assert "initial-specification" in blank.document_refs
+        assert blank.association_refs
 
         template = work_template(
             "ast05-creative-render",
@@ -194,8 +226,55 @@ def test_shared_template_pack_authoring_and_cpu_attempt_use_runtime_only(
                         "fields": {
                             "capability_id": CAPABILITY,
                             "capability_digest": cpu_record.capability_digest,
-                            "spec": {"pack_pin": pinned},
+                            "input_object_ids": [source_digest],
+                            "spec": {
+                                "pack_pin": pinned,
+                                "inputs": {
+                                    "pack_snapshot": {
+                                        "digest": source_digest,
+                                        "filename": "skill-SKILL.md",
+                                    }
+                                },
+                            },
                         },
+                    }
+                ],
+                "criteria": [
+                    {
+                        "local_id": "creative-acceptance",
+                        "kind": "criterion",
+                        "title": "Creative acceptance",
+                        "parent": {"$local": "creative-render"},
+                        "fields": {
+                            "description": "The pinned source is consumed by the CPU attempt."
+                        },
+                    }
+                ],
+                "gates": [
+                    {
+                        "local_id": "creative-gate",
+                        "kind": "gate",
+                        "title": "Creative gate",
+                        "dependencies": [{"$local": "creative-acceptance"}],
+                        "fields": {"level": "required"},
+                    }
+                ],
+                "documents": [
+                    {
+                        "local_id": "creative-brief",
+                        "title": "Creative brief",
+                        "role": "creative-brief",
+                        "content": {"prompt": "a quiet opening", "source": "AST05"},
+                    }
+                ],
+                "document_links": [
+                    {
+                        "subject": {"$local": "creative-render"},
+                        "document": {"$local": "creative-brief"},
+                        "namespace": "work.tasks",
+                        "key": "brief",
+                        "binding": "current",
+                        "access_mode": "read",
                     }
                 ]
             },
@@ -211,6 +290,11 @@ def test_shared_template_pack_authoring_and_cpu_attempt_use_runtime_only(
         assert task["project_id"] == project_id
         assert task["spec"]["spec"]["template_origin"]["id"] == template.id
         assert task["spec"]["spec"]["pack_pin"]["revision"] == "rev-1"
+        template_result = admitted.template_result
+        assert template_result is not None
+        assert {record.kind.value for record in template_result.records} == {"task", "criterion", "gate"}
+        assert "creative-brief" in template_result.document_refs
+        assert "creative-render:work.tasks:brief" in template_result.association_refs
 
         critique = adapter.record_critique(
             project_id,
@@ -269,9 +353,8 @@ def test_shared_template_pack_authoring_and_cpu_attempt_use_runtime_only(
         assert released.revision == "rev-2"
         assert not checkout_file.exists()
 
-        prior = bridge.managed_packs.read(pack.pack_id, revision="rev-1")
         current = bridge.managed_packs.read(pack.pack_id, revision="rev-2")
-        assert base64.b64decode(prior["resources"]["skill/SKILL.md"]["content_b64"]) != updated
+        assert prior_skill != updated
         assert base64.b64decode(current["resources"]["skill/SKILL.md"]["content_b64"]) == updated
         authoring_events = bridge.authoring.reader.list_events(
             stream=f"authoring:{pack.pack_id}"
@@ -309,11 +392,17 @@ def test_shared_template_pack_authoring_and_cpu_attempt_use_runtime_only(
         cpu_task = _data(client.get_task(task["task_id"]))
         assert cpu_task["state"] == "succeeded"
         output = cpu_task["result"]["outputs"][0]
-        assert output["digest"] == _digest(cpu_output)
-        assert output["size"] == len(cpu_output)
-        assert _data(client.get_object(output["digest"]))["data"] == cpu_output
+        expected_output = (
+            b"AST05-PINNED-SOURCE\n"
+            + hashlib.sha256(prior_skill).hexdigest().encode("ascii")
+            + b"\n"
+        )
+        assert output["digest"] == _digest(expected_output)
+        assert output["size"] == len(expected_output)
+        assert _data(client.get_object(output["digest"]))["data"] == expected_output
         # The accepted task still points at the immutable pre-edit pack pin.
         assert cpu_task["spec"]["spec"]["pack_pin"]["revision"] == "rev-1"
+        assert cpu_task["spec"]["spec"]["inputs"]["pack_snapshot"]["digest"] == source_digest
     finally:
         if host is not None:
             host.shutdown()
