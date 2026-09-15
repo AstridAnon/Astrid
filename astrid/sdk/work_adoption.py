@@ -13,8 +13,6 @@ here.  Durable effects go through the supplied ``WorkspaceClient``.
 
 from __future__ import annotations
 
-import base64
-import hashlib
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -28,11 +26,12 @@ class SharedWorkError(ValueError):
 
 
 try:  # The Astrid standalone distribution remains importable without FND.
-    from herzchen.packs.authoring import ManagedPack, describe_compatibility
+    from herzchen.contracts import ResourceRef
+    from herzchen.packs.authoring import ManagedPack
     from herzchen.packs.templates import WorkProtocol, WorkTemplate, render_template
 except ImportError as exc:  # pragma: no cover - exercised by standalone installs
-    ManagedPack = WorkProtocol = WorkTemplate = None  # type: ignore[assignment]
-    describe_compatibility = render_template = None  # type: ignore[assignment]
+    ResourceRef = ManagedPack = WorkProtocol = WorkTemplate = None  # type: ignore[assignment]
+    render_template = None  # type: ignore[assignment]
     _IMPORT_ERROR: BaseException | None = exc
 else:
     _IMPORT_ERROR = None
@@ -52,10 +51,6 @@ def _data(value: Any) -> Mapping[str, Any]:
     if isinstance(value, Mapping):
         return value
     raise SharedWorkError("Runtime returned a non-object resource")
-
-
-def _sha256(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
 
 
 def _task_nodes(seed: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
@@ -104,11 +99,52 @@ class PackRevision:
 class RuntimeSharedWorkAdapter:
     """Use shared Herzchen resources while Runtime remains the only writer."""
 
-    def __init__(self, transport: Any) -> None:
+    def __init__(self, transport: Any, *, managed_pack_handler: Any = None, managed_pack_actor: Any = None) -> None:
         if transport is None:
             raise TypeError("transport is required")
         self.transport = transport
+        self.managed_pack_handler = managed_pack_handler
+        self.managed_pack_actor = managed_pack_actor
         _require_shared()
+
+    def _require_managed_pack_handler(self) -> Any:
+        handler = self.managed_pack_handler
+        if handler is None:
+            raise SharedWorkUnavailable(
+                "Runtime must supply the public ManagedPackAuthoringHandler owner seam"
+            )
+        return handler
+
+    def _managed_pack_actor(self) -> Any:
+        actor = self.managed_pack_actor
+        if actor is None:
+            actor = getattr(self._require_managed_pack_handler(), "actor", None)
+        if actor is None:
+            raise SharedWorkUnavailable("public pack handler requires the Runtime-owned authenticated actor")
+        return actor
+
+    @staticmethod
+    def _pack_revision(result: Any, project_id: str, pack_id: str, *, status: str = "authoring") -> PackRevision:
+        revision = str(result.revision)
+        if not revision.startswith("rev-"):
+            raise SharedWorkError("shared pack authoring returned an unpinned revision")
+        try:
+            version = int(revision.removeprefix("rev-"))
+        except ValueError as exc:
+            raise SharedWorkError("shared pack authoring returned an invalid revision") from exc
+        receipt = result.receipt
+        response = receipt.to_dict() if hasattr(receipt, "to_dict") else receipt
+        return PackRevision(project_id, RuntimeSharedWorkAdapter.pack_document_id(pack_id), version, revision, status, response)
+
+    def _pack_identity(self, pack_id: str) -> Any:
+        handler = self._require_managed_pack_handler()
+        reader = getattr(handler, "reader", None)
+        if reader is None or ResourceRef is None:
+            raise SharedWorkUnavailable("public pack handler did not expose its finite Runtime reader")
+        identity = reader.get_identity(ResourceRef(reader.authority, "managed_pack", pack_id))
+        if identity is None:
+            raise SharedWorkError(f"managed pack is not adopted: {pack_id!r}")
+        return identity
 
     @staticmethod
     def render(template: Any, parameters: Mapping[str, Any] | None = None) -> Any:
@@ -242,51 +278,26 @@ class RuntimeSharedWorkAdapter:
             raise SharedWorkError("pack_id must be an opaque non-blank string")
         return f"managed-pack-{pack_id}"
 
-    @staticmethod
-    def _pack_content(pack: Any, *, revision: str, status: str = "authoring") -> dict[str, Any]:
+    def adopt_pack(self, project_id: str, pack: Any, *, logical_request_key: str) -> PackRevision:
+        """Adopt through the public FND handler over Runtime's owner."""
         _require_shared()
         if not isinstance(pack, ManagedPack):
             raise SharedWorkError("pack must be the shared Herzchen ManagedPack type")
-        resources = {
-            item.path: {
-                "kind": item.kind,
-                "content_b64": base64.b64encode(item.content).decode("ascii"),
-                "digest": item.source_digest,
-                "source_ref": item.source_ref.to_dict(),
-            }
-            for item in pack.resources
-        }
-        return {
-            "record_type": "managed_pack.authoring",
-            "pack_id": pack.pack_id,
-            "pack_version": pack.version,
-            "authoring_revision": revision,
-            "status": status,
-            "source": pack.source.to_dict(),
-            "manifest": dict(pack.manifest),
-            "resources": resources,
-            "execution_pins": [item.to_dict() for item in pack.execution_pins],
-            "compatibility": describe_compatibility(pack).to_dict(),
-        }
-
-    def adopt_pack(self, project_id: str, pack: Any, *, logical_request_key: str) -> PackRevision:
-        """Create the first pack snapshot as a Runtime-owned project document."""
-        document_id = self.pack_document_id(getattr(pack, "pack_id", ""))
-        content = self._pack_content(pack, revision="rev-1")
-        response = self.transport.create_document(
-            project_id,
-            document_id,
-            "managed_pack.authoring",
-            content,
-            idempotency_key=logical_request_key,
+        handler = self._require_managed_pack_handler()
+        result = handler.author(
+            pack,
+            logical_request_key=logical_request_key,
+            actor=self._managed_pack_actor(),
         )
-        data = _data(response)
-        return PackRevision(project_id, document_id, int(data.get("version", 1)), "rev-1", "authoring", response)
+        return self._pack_revision(result, project_id, pack.pack_id)
 
     def read_pack(self, project_id: str, pack_id: str) -> Mapping[str, Any]:
-        document = _data(self.transport.get_document(project_id, self.pack_document_id(pack_id)))
-        content = document.get("content")
-        return content if isinstance(content, Mapping) else document
+        del project_id  # The public Runtime owner scopes the pack identity.
+        handler = self._require_managed_pack_handler()
+        value = handler.read(pack_id)
+        if not isinstance(value, Mapping):
+            raise SharedWorkError("public pack handler returned a non-object resource")
+        return value
 
     def author_pack(
         self,
@@ -297,67 +308,116 @@ class RuntimeSharedWorkAdapter:
         expected_version: int,
         logical_request_key: str,
     ) -> PackRevision:
-        """Edit only declared resources and retain all Runtime-owned siblings."""
+        """Edit via the public FND handler and Runtime's one owner ledger."""
         _require_shared()
         if not isinstance(pack, ManagedPack):
             raise SharedWorkError("pack must be the shared Herzchen ManagedPack type")
-        current = self.read_pack(project_id, pack.pack_id)
-        if current.get("status") == "expired":
-            raise SharedWorkError("managed pack authoring copy is expired")
-        declared = {item.path: item for item in pack.resources}
-        unknown = sorted(set(updates).difference(declared))
-        if unknown:
-            raise SharedWorkError(f"authoring update is not an admitted resource: {unknown[0]}")
-        resources = dict(current.get("content", {}).get("resources", current.get("resources", {})))
-        for path, value in updates.items():
-            if isinstance(value, str):
-                value = value.encode("utf-8")
-            if isinstance(value, bytearray):
-                value = bytes(value)
-            if not isinstance(value, bytes):
-                raise SharedWorkError(f"authoring content for {path!r} must be bytes or text")
-            base = dict(resources.get(path) or {})
-            base["content_b64"] = base64.b64encode(value).decode("ascii")
-            base["digest"] = _sha256(value)
-            resources[path] = base
-        content = dict(current.get("content") or current)
-        content["resources"] = {path: resources[path] for path in sorted(resources)}
-        content["authoring_revision"] = f"rev-{expected_version + 1}"
-        content["status"] = "authoring"
-        response = self.transport.update_document(
-            project_id,
-            self.pack_document_id(pack.pack_id),
-            expected_version=expected_version,
-            idempotency_key=logical_request_key,
-            content=content,
+        identity = self._pack_identity(pack.pack_id)
+        if identity.version != expected_version:
+            raise SharedWorkError(
+                f"managed pack version mismatch: expected {expected_version}, current {identity.version}"
+            )
+        handler = self._require_managed_pack_handler()
+        result = handler.author(
+            pack,
+            updates,
+            logical_request_key=logical_request_key,
+            actor=self._managed_pack_actor(),
         )
-        data = _data(response)
-        return PackRevision(project_id, self.pack_document_id(pack.pack_id), int(data.get("version", expected_version + 1)), content["authoring_revision"], "authoring", response)
+        return self._pack_revision(result, project_id, pack.pack_id)
 
     def expire_pack(self, project_id: str, pack_id: str, *, expected_version: int, logical_request_key: str) -> PackRevision:
-        current = self.read_pack(project_id, pack_id)
-        content = dict(current.get("content") or current)
-        content["status"] = "expired"
-        content["expired_revision"] = content.get("authoring_revision")
-        response = self.transport.update_document(
-            project_id,
-            self.pack_document_id(pack_id),
-            expected_version=expected_version,
-            idempotency_key=logical_request_key,
-            content=content,
+        del project_id, pack_id, expected_version, logical_request_key
+        raise SharedWorkUnavailable(
+            "managed-pack expiry requires release_pack_authoring with the active EDT checkout"
         )
-        data = _data(response)
-        return PackRevision(project_id, self.pack_document_id(pack_id), int(data.get("version", expected_version + 1)), str(content.get("authoring_revision")), "expired", response)
+
+    def release_pack_authoring(
+        self,
+        project_id: str,
+        pack: Any,
+        *,
+        authoring_lifecycle: Any,
+        authoring_target: Any,
+        checkout_root: Any,
+        registered_files: Any,
+        logical_request_key: str,
+        writer_identity: str,
+        mode: str = "manual",
+    ) -> PackRevision:
+        """Finish and retire one materialised pack checkout through EDT.
+
+        The checkout and its authenticated writer lease belong to the host;
+        Runtime still owns every durable session, finish, cleanup, and pack
+        event.  This intentionally requires the host's exact checkout inputs
+        instead of inventing a status-only expiry command.
+        """
+        _require_shared()
+        if not isinstance(pack, ManagedPack):
+            raise SharedWorkError("pack must be the shared Herzchen ManagedPack type")
+        if authoring_lifecycle is None or authoring_target is None:
+            raise SharedWorkUnavailable("the public EDT authoring lifecycle and active checkout are required")
+        if not isinstance(writer_identity, str) or not writer_identity:
+            raise SharedWorkError("writer_identity is required for safe checkout retirement")
+        handler = self._require_managed_pack_handler()
+        semantic_handler = handler.lifecycle_handler(
+            pack, request_id=f"{logical_request_key}:content"
+        )
+        result = authoring_lifecycle.finish(
+            authoring_target,
+            request_id=f"{logical_request_key}:session",
+            mode=mode,
+            checkout_root=checkout_root,
+            registered_files=registered_files,
+            handler=semantic_handler,
+            writer_identity=writer_identity,
+        )
+        finish = getattr(result, "finish", None)
+        application = getattr(finish, "application", None)
+        cleanup = getattr(result, "cleanup", None)
+        durable_cleanup = getattr(result, "durable_cleanup", None)
+        if getattr(finish, "status", None) not in {"finished", "already_finished", "replayed"}:
+            raise SharedWorkError(
+                f"EDT did not finish the managed-pack checkout: {getattr(finish, 'error', None)!r}"
+            )
+        if cleanup is None or not bool(getattr(cleanup, "complete", False)):
+            raise SharedWorkError("EDT physical checkout cleanup did not complete")
+        durable_cleanup_status = getattr(durable_cleanup, "cleanup", None)
+        if durable_cleanup_status is None or getattr(durable_cleanup_status, "value", durable_cleanup_status) != "complete":
+            raise SharedWorkError("EDT durable cleanup did not complete")
+        if application is None:
+            identity = self._pack_identity(pack.pack_id)
+            return PackRevision(
+                project_id,
+                self.pack_document_id(pack.pack_id),
+                identity.version,
+                str(identity.ref.revision),
+                "released",
+                None,
+            )
+        return self._pack_revision(application, project_id, pack.pack_id, status="released")
 
     def pinned_pack_execution(self, project_id: str, pack_id: str) -> Mapping[str, Any]:
         """Return the immutable pack facts a Runtime task should pin."""
         content = self.read_pack(project_id, pack_id)
+        identity = self._pack_identity(pack_id)
         resources = content.get("resources", {})
         return {
             "pack_id": content.get("pack_id", pack_id),
-            "revision": content.get("authoring_revision"),
+            # The public current read is an identity payload and therefore
+            # need not duplicate its head revision.  Pin the Runtime-owned
+            # identity ref, which is the authoritative current revision.
+            "revision": identity.ref.revision,
             "execution_pins": list(content.get("execution_pins", [])),
-            "resource_digests": {path: value.get("digest") for path, value in resources.items() if isinstance(value, Mapping)},
+            "resource_digests": {
+                path: (
+                    value.get("descriptor", {}).get("digest")
+                    if isinstance(value.get("descriptor"), Mapping)
+                    else value.get("digest")
+                )
+                for path, value in resources.items()
+                if isinstance(value, Mapping)
+            },
         }
 
 

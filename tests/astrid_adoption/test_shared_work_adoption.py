@@ -4,30 +4,36 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 
-RUNTIME_ROOT = Path(__file__).resolve().parents[2].parent.parent / "ast03-worktrees" / "runtime-8b"
+
+ASTRID_ROOT = Path(__file__).resolve().parents[2]
+RUNTIME_ROOT = ASTRID_ROOT.parent / "runtime-pack-owner"
+ASTRID_SOURCE_ROOT = ASTRID_ROOT.parent.parent / "ast03-worktrees" / "astrid-cf7"
 sys.path.insert(0, str(RUNTIME_ROOT))
+sys.path.insert(0, str(ASTRID_ROOT))
 
+from herzchen.authoring import FileWriterLeaseAuthority  # noqa: E402
 from herzchen.contracts import ResourceRef  # noqa: E402
-from herzchen.packs.authoring import (  # noqa: E402
-    ExecutionPin,
-    ManagedPack,
-    ManagedResource,
-    ManagedSourceIdentity,
-)
+from herzchen.packs.authoring import read_managed_pack  # noqa: E402
 from herzchen.packs.templates import work_protocol, work_template  # noqa: E402
 from runtime_protocol.daemon import RuntimeDaemon  # noqa: E402
 from runtime_protocol.store import RealmStore  # noqa: E402
 
+from astrid.core.execution.generic_host import GenericPackHost, RuntimeProtocolClient  # noqa: E402
+from astrid.core.execution.guards import ExecutionGuardPolicy  # noqa: E402
+from astrid.core.pack.source_setup import _tree_digest  # noqa: E402
 from astrid.sdk.work_adoption import RuntimeSharedWorkAdapter  # noqa: E402
 from astrid.sdk.workspace_client import WorkspaceClient  # noqa: E402
 
 
 CAPABILITY = "render.ast05.cpu"
-CAPABILITY_DIGEST = "sha256:" + hashlib.sha256(CAPABILITY.encode()).hexdigest()
+SOURCE_REVISION = "90d15804b5b76a10a14a37906f55dfa975d9aa4c"
 
 
 def _digest(value: bytes) -> str:
@@ -38,49 +44,116 @@ def _data(value):
     return value["data"] if isinstance(value, dict) and isinstance(value.get("data"), dict) else value
 
 
-def _managed_pack(tmp_path: Path) -> ManagedPack:
-    root = tmp_path / "managed-pack"
+def _canonical_pack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Load the real accepted managed pack through canonical discovery."""
+    source_root = ASTRID_SOURCE_ROOT.resolve()
+    pack_root = source_root / "astrid" / "packs" / "vibecomfy"
+    observed_revision = subprocess.check_output(
+        ["git", "-C", str(source_root), "rev-parse", "HEAD"], text=True
+    ).strip()
+    assert observed_revision == SOURCE_REVISION
+    manifest = pack_root / "pack.yaml"
+    state_path = tmp_path / "pack-sources.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "active": {
+                    "vibecomfy": {
+                        "pack_id": "vibecomfy",
+                        "pack_root": str(pack_root),
+                        "repository": "astrid-accepted-cpu-source",
+                        "revision": observed_revision,
+                        "pack_subpath": ".",
+                        "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                        "tree_sha256": _tree_digest(pack_root),
+                        "source_kind": "managed",
+                    }
+                },
+                "cached": {},
+                "disabled": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ASTRID_SOURCE_STATE", str(state_path))
+    pack = read_managed_pack("vibecomfy", project_root=ASTRID_ROOT)
+    assert pack.source.source_revision == SOURCE_REVISION
+    assert pack.source.source_manifest_sha256 == hashlib.sha256(manifest.read_bytes()).hexdigest()
+    assert any(item.path == "skill/SKILL.md" for item in pack.resources)
+    return pack
+
+
+def _cpu_render_pack(tmp_path: Path) -> tuple[Path, bytes]:
+    """Create a deterministic, offline CPU renderer for GenericPackHost."""
+    output = b"P6\n2 2\n255\n\xff\x00\x00\x00\xff\x00\x00\x00\xff\xff\xff\xff"
+    output_digest = _digest(output)
+    root = tmp_path / "ast05-cpu-render-pack"
     root.mkdir()
-    (root / "pack.yaml").write_text("id: ast05-pack\nschema_version: 2\n", encoding="utf-8")
-    old = b"old-authoring-copy"
-    source_revision = "a" * 40
-    source = ManagedSourceIdentity(
-        pack_id="ast05-pack",
-        source_kind="managed",
-        source_revision=source_revision,
-        source_tree_sha256="b" * 64,
-        source_manifest_sha256="c" * 64,
-        source_inventory_identity="d" * 64,
-        pack_root=str(root),
-        manifest_path=str(root / "pack.yaml"),
+    (root / "executor.yaml").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "id": CAPABILITY,
+                "name": "AST05 deterministic CPU render",
+                "kind": "external",
+                "version": "1.0",
+                "command": {
+                    "argv": [
+                        "{python_exec}",
+                        "-c",
+                        (
+                            "from pathlib import Path; import hashlib, json; "
+                            "data=" + repr(output) + "; out=Path('{out}'); "
+                            "path=out/'render.ppm'; path.write_bytes(data); "
+                            "(out/'manifest.json').write_text(json.dumps({'outputs': "
+                            "[{'name':'result','path':'render.ppm','content_hash':'"
+                            + output_digest
+                            + "','bytes':len(data),'ordinal':0,'is_primary':True,'role':'result'}]}))"
+                        ),
+                    ]
+                },
+                "outputs": [
+                    {
+                        "name": "result",
+                        "type": "file",
+                        "path_template": "{out}/render.ppm",
+                        "artifact_type": "image/x-portable-pixmap",
+                    }
+                ],
+                "metadata": {"adapter_family": "cpu", "resource_keys": ["cpu"]},
+            }
+        ),
+        encoding="utf-8",
     )
-    resource_ref = ResourceRef("astrid-managed", "managed_pack", "ast05-pack", source_revision)
-    return ManagedPack(
-        "ast05-pack",
-        "2.0.0",
-        source,
-        {"id": "ast05-pack", "schema_version": 2},
-        (ManagedResource("skill/SKILL.md", "skill", old, hashlib.sha256(old).hexdigest(), resource_ref),),
-        (ExecutionPin("ast05-pack/skill/SKILL.md", "skill", source_revision, hashlib.sha256(old).hexdigest(), role="capability"),),
-        ("normal",),
-    )
+    return root, output
 
 
-def test_shared_template_pack_authoring_and_cpu_attempt_use_runtime_only(tmp_path: Path) -> None:
+def test_shared_template_pack_authoring_and_cpu_attempt_use_runtime_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     realm = tmp_path / "realm"
     support = tmp_path / "support"
     RealmStore.initialize(realm, realm_id="ast05-shared-work").close()
     daemon = RuntimeDaemon(realm, support_root=support).start()
+    host: GenericPackHost | None = None
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
-        adapter = RuntimeSharedWorkAdapter(client)
-        project = _data(client.create_project("AST-05 shared work", slug="ast05-shared-work", idempotency_key="ast05-project"))
-        project_id = project["project_id"]
-        client.register_capability(CAPABILITY, CAPABILITY_DIGEST, idempotency_key="ast05-capability")
-        client.register_executor(
-            {"executor_id": "ast05-cpu-host", "capabilities": [CAPABILITY]},
-            idempotency_key="ast05-executor",
+        bridge = daemon.service.herzchen
+        assert bridge is not None
+        assert bridge.generic_contract_error is None
+        assert bridge.authoring is not None
+        adapter = RuntimeSharedWorkAdapter(
+            client,
+            managed_pack_handler=bridge.managed_packs,
+            managed_pack_actor=bridge.actor,
         )
+        project = _data(
+            client.create_project(
+                "AST-05 shared work", slug="ast05-shared-work", idempotency_key="ast05-project"
+            )
+        )
+        project_id = project["project_id"]
 
         protocol = work_protocol(
             "ast05-creative-protocol",
@@ -89,11 +162,20 @@ def test_shared_template_pack_authoring_and_cpu_attempt_use_runtime_only(tmp_pat
         project = adapter.adopt_protocol(project_id, protocol, logical_request_key="ast05-protocol")
         assert project["metadata"]["shared_work"]["protocol_ref"]["id"] == protocol.id
 
-        pack = _managed_pack(tmp_path)
+        cpu_pack, cpu_output = _cpu_render_pack(tmp_path)
+        cpu_record = GenericPackHost(pack_roots=[cpu_pack]).discover()[0]
+        client.register_capability(
+            CAPABILITY,
+            cpu_record.capability_digest,
+            idempotency_key="ast05-cpu-capability",
+        )
+
+        pack = _canonical_pack(tmp_path, monkeypatch)
         adopted = adapter.adopt_pack(project_id, pack, logical_request_key="ast05-pack-adopt")
         pinned = adapter.pinned_pack_execution(project_id, pack.pack_id)
         assert adopted.revision == "rev-1"
         assert pinned["revision"] == "rev-1"
+        assert pinned["resource_digests"]["skill/SKILL.md"]
 
         template = work_template(
             "ast05-creative-render",
@@ -111,7 +193,7 @@ def test_shared_template_pack_authoring_and_cpu_attempt_use_runtime_only(tmp_pat
                         "title": "Creative CPU render",
                         "fields": {
                             "capability_id": CAPABILITY,
-                            "capability_digest": CAPABILITY_DIGEST,
+                            "capability_digest": cpu_record.capability_digest,
                             "spec": {"pack_pin": pinned},
                         },
                     }
@@ -130,7 +212,6 @@ def test_shared_template_pack_authoring_and_cpu_attempt_use_runtime_only(tmp_pat
         assert task["spec"]["spec"]["template_origin"]["id"] == template.id
         assert task["spec"]["spec"]["pack_pin"]["revision"] == "rev-1"
 
-        claim = _data(client.claim_task(executor_id="ast05-cpu-host", capability_ids=[CAPABILITY], idempotency_key="ast05-claim"))
         critique = adapter.record_critique(
             project_id,
             task["task_id"],
@@ -138,50 +219,102 @@ def test_shared_template_pack_authoring_and_cpu_attempt_use_runtime_only(tmp_pat
             logical_request_key="ast05-critique",
         )
         assert critique["kind"] == "creative.critique"
-        assert _data(client.get_task(task["task_id"]))["state"] == "running"
-        edited = adapter.author_pack(
+
+        # The pack edit is a real EDT checkout. Its semantic handler is the
+        # public PKG handler, and the Runtime owner records both event streams
+        # in the same realm database before the exact registered file is
+        # physically removed.
+        checkout = tmp_path / "ast05-pack-checkout"
+        checkout.mkdir()
+        updated = b"# AST05 authored CPU-safe work\n"
+        checkout_payload = json.dumps(
+            {"updates": {"skill/SKILL.md": base64.b64encode(updated).decode("ascii")}}
+        ).encode("utf-8")
+        checkout_file = checkout / "pack-content.json"
+        checkout_file.write_bytes(checkout_payload)
+        leases = FileWriterLeaseAuthority(
+            support / "writer-locks",
+            authority="ast05-writer-lease",
+            secret=b"ast05-writer-lease-secret-0123456789",
+            writer_identities=("ast05-runtime-host",),
+        )
+        lifecycle = bridge.make_authoring_lifecycle(
+            writer_leases=leases, writer_identity="ast05-runtime-host"
+        )
+        pack_identity = bridge.managed_packs.reader.get_identity(
+            ResourceRef(bridge.authority, "managed_pack", pack.pack_id)
+        )
+        opened = lifecycle.open(
+            ResourceRef(bridge.authority, "managed_pack", pack.pack_id, pack_identity.ref.revision),
+            bridge.actor,
+            request_id="ast05-pack-open",
+            base_revision="rev-1",
+            initial_content=checkout_payload,
+            materialize=lambda _checkout, _initial_bytes, **_: {
+                "path": str(checkout),
+                "registered_files": ("pack-content.json",),
+            },
+        )
+        released = adapter.release_pack_authoring(
             project_id,
             pack,
-            {"skill/SKILL.md": b"new-authoring-copy"},
-            expected_version=1,
-            logical_request_key="ast05-pack-edit",
+            authoring_lifecycle=lifecycle,
+            authoring_target=opened,
+            checkout_root=checkout,
+            registered_files=("pack-content.json",),
+            logical_request_key="ast05-pack",
+            writer_identity="ast05-runtime-host",
         )
-        expired = adapter.expire_pack(
-            project_id,
-            pack.pack_id,
-            expected_version=2,
-            logical_request_key="ast05-pack-expire",
-        )
-        assert edited.revision == "rev-2"
-        assert expired.status == "expired"
-        assert adapter.read_pack(project_id, pack.pack_id)["status"] == "expired"
+        assert released.status == "released"
+        assert released.revision == "rev-2"
+        assert not checkout_file.exists()
 
-        payload = b"ast05-cpu-output"
-        settled = _data(
-            client.settle_attempt(
-                claim["attempt_id"],
-                {
-                    "lease_id": claim["lease_id"],
-                    "fence": claim["fence"],
-                    "runtime_epoch": claim["runtime_epoch"],
-                    "outputs": [
-                        {
-                            "name": "result",
-                            "kind": "object",
-                            "digest": _digest(payload),
-                            "media_type": "text/plain",
-                            "size": len(payload),
-                            "data_base64": base64.b64encode(payload).decode("ascii"),
-                        }
-                    ],
-                },
-                idempotency_key="ast05-settle",
-            )
+        prior = bridge.managed_packs.read(pack.pack_id, revision="rev-1")
+        current = bridge.managed_packs.read(pack.pack_id, revision="rev-2")
+        assert base64.b64decode(prior["resources"]["skill/SKILL.md"]["content_b64"]) != updated
+        assert base64.b64decode(current["resources"]["skill/SKILL.md"]["content_b64"]) == updated
+        authoring_events = bridge.authoring.reader.list_events(
+            stream=f"authoring:{pack.pack_id}"
         )
-        assert settled["state"] == "succeeded"
-        readback = _data(client.get_task(task["task_id"]))
-        assert readback["state"] == "succeeded"
-        assert readback["spec"]["spec"]["pack_pin"]["revision"] == "rev-1"
-        assert readback["spec"]["spec"]["template_origin"]["revision"] == template.revision
+        assert [event.event_type for event in authoring_events] == [
+            "authoring.open",
+            "authoring.metadata",
+            "authoring.finish.claim",
+            "authoring.finish",
+            "authoring.cleanup",
+        ]
+        transaction_rows = bridge._generic_writer.store.conn.execute(
+            "SELECT transaction_id FROM herzchen_events WHERE stream=? ORDER BY sequence",
+            (f"authoring:{pack.pack_id}",),
+        ).fetchall()
+        assert all(row["transaction_id"] for row in transaction_rows)
+        assert (bridge._generic_writer.store.root / "realm.sqlite3").is_file()
+
+        host = GenericPackHost(
+            pack_roots=[cpu_pack],
+            client=RuntimeProtocolClient(daemon.endpoint, daemon.token),
+            executor_id="ast05-cpu-host",
+            attempt_root=tmp_path / "ast05-attempt",
+            execution_policy=ExecutionGuardPolicy(
+                scratch_floor_bytes=1,
+                evidence_cap_bytes=1024 * 1024,
+                deadline_seconds=30.0,
+            ),
+        )
+        registration = host.register()
+        assert registration["registration"].executor_id == "ast05-cpu-host"
+        outcomes = host.run(once=True)
+        assert len(outcomes) == 1
+        assert outcomes[0].state == "succeeded"
+        cpu_task = _data(client.get_task(task["task_id"]))
+        assert cpu_task["state"] == "succeeded"
+        output = cpu_task["result"]["outputs"][0]
+        assert output["digest"] == _digest(cpu_output)
+        assert output["size"] == len(cpu_output)
+        assert _data(client.get_object(output["digest"]))["data"] == cpu_output
+        # The accepted task still points at the immutable pre-edit pack pin.
+        assert cpu_task["spec"]["spec"]["pack_pin"]["revision"] == "rev-1"
     finally:
+        if host is not None:
+            host.shutdown()
         daemon.stop()
