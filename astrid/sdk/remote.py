@@ -13,6 +13,7 @@ from astrid.core.receipts.contract import CommandReceipt
 from .contracts import DomainResult, ErrorObject
 from .pagination import page_pair, paged_rows
 from .workspace_client import WorkspaceClient, WorkspaceClientError
+from .herzchen_adapter import SharedIdentityUnavailable, preserve_runtime_project_id
 
 
 def _full_mapping(value: Any) -> dict[str, Any] | None:
@@ -377,6 +378,13 @@ class RemoteTasks(_RemoteFamily):
         return self._typed("register_capability", capability_id, definition_digest, key=idempotency_key, idempotency_key=idempotency_key)
     def create(self, *, project_id: str | None, capability: str, spec: Mapping[str, Any], input_manifest=None, idempotency_key=None, settlement_effect=None, storage_estimate: Mapping[str, int] | None = None, capability_digest: str | None = None, generation_intent: Mapping[str, Any] | None = None):
         key = idempotency_key or uuid.uuid4().hex
+        try:
+            project_id = preserve_runtime_project_id(project_id)
+        except (SharedIdentityUnavailable, ValueError) as exc:
+            return DomainResult.failure(
+                ErrorObject("validation_error", str(exc), {"field": "project_id"}),
+                idempotency_key=key,
+            )
         capabilities = paged_rows(self._client.list_capabilities, limit=50)
         if capabilities is None:
             return DomainResult.failure(
