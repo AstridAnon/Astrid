@@ -66,11 +66,13 @@ class _RemoteFamily:
             elif operation == "create_project": value = self._client.create_project(*args, **kwargs)
             elif operation == "create_project_reference": value = self._client.create_project_reference(*args, **kwargs)
             elif operation == "create_project_shot": value = self._client.create_project_shot(*args, **kwargs)
+            elif operation == "create_document": value = self._client.create_document(*args, **kwargs)
             elif operation == "create_timeline_document": value = self._client.create_timeline_document(*args, **kwargs)
             elif operation == "create_variant": value = self._client.create_variant(*args, **kwargs)
             elif operation == "current_project": value = self._client.current_project(*args, **kwargs)
             elif operation == "diff_timeline": value = self._client.diff_timeline(*args, **kwargs)
             elif operation == "get_generation": value = self._client.get_generation(*args, **kwargs)
+            elif operation == "get_document": value = self._client.get_document(*args, **kwargs)
             elif operation == "get_object": value = self._client.get_object(*args, **kwargs)
             elif operation == "get_project": value = self._client.get_project(*args, **kwargs)
             elif operation == "get_project_reference": value = self._client.get_project_reference(*args, **kwargs)
@@ -85,6 +87,7 @@ class _RemoteFamily:
             elif operation == "link_references": value = self._client.link_references(*args, **kwargs)
             elif operation == "list_events": value = self._client.list_events(*args, **kwargs)
             elif operation == "list_generations": value = self._client.list_generations(*args, **kwargs)
+            elif operation == "list_documents": value = self._client.list_documents(*args, **kwargs)
             elif operation == "list_media_relations": value = self._client.list_media_relations(*args, **kwargs)
             elif operation == "list_project_objects": value = self._client.list_project_objects(*args, **kwargs)
             elif operation == "list_project_references": value = self._client.list_project_references(*args, **kwargs)
@@ -118,6 +121,7 @@ class _RemoteFamily:
             elif operation == "update_project": value = self._client.update_project(*args, **kwargs)
             elif operation == "update_project_reference": value = self._client.update_project_reference(*args, **kwargs)
             elif operation == "update_project_shot": value = self._client.update_project_shot(*args, **kwargs)
+            elif operation == "update_document": value = self._client.update_document(*args, **kwargs)
             elif operation == "update_timeline_document": value = self._client.update_timeline_document(*args, **kwargs)
             elif operation == "replace_timeline_clip": value = self._client.replace_timeline_clip(*args, **kwargs)
             else: raise ValueError(f"unsupported generated operation: {operation}")
@@ -140,6 +144,36 @@ class RemoteProjects(_RemoteFamily):
     def update(self, ref, *, name=None, metadata=None, expected_version=None, idempotency_key=None):
         key = idempotency_key or uuid.uuid4().hex
         return self._typed("update_project", ref, key=key, idempotency_key=key, name=name, metadata=metadata, expected_version=expected_version)
+    def update_metadata_namespace(
+        self,
+        project,
+        namespace: str,
+        values: Mapping[str, Any],
+        *,
+        expected_version: int | None = None,
+        idempotency_key=None,
+    ):
+        """Merge one project metadata namespace through Runtime ownership."""
+        key = idempotency_key or uuid.uuid4().hex
+        if not project:
+            return DomainResult.failure(ErrorObject("validation_error", "project is required", {"field": "project"}), idempotency_key=key)
+        if not isinstance(namespace, str) or not namespace.strip():
+            return DomainResult.failure(ErrorObject("validation_error", "metadata namespace is required", {"field": "namespace"}), idempotency_key=key)
+        if not isinstance(values, Mapping):
+            return DomainResult.failure(ErrorObject("validation_error", "metadata namespace values must be an object", {"field": "values"}), idempotency_key=key)
+        try:
+            current = self._client.get_project(project)
+            version = int(expected_version) if expected_version is not None else int(current.get("version", 1))
+            metadata = dict(current.get("metadata") or {})
+            current_namespace = metadata.get(namespace, {})
+            if current_namespace is None:
+                current_namespace = {}
+            if not isinstance(current_namespace, Mapping):
+                return DomainResult.failure(ErrorObject("validation_error", "existing metadata namespace is not an object", {"namespace": namespace}), idempotency_key=key)
+            metadata[namespace] = {**dict(current_namespace), **dict(values)}
+        except WorkspaceClientError as exc:
+            return DomainResult.failure(ErrorObject(exc.code, exc.message, exc.details), idempotency_key=key)
+        return self._typed("update_project", project, key=key, idempotency_key=key, expected_version=version, metadata=metadata)
     def select(self, ref, *, scope="workspace", idempotency_key=None):
         key = idempotency_key or uuid.uuid4().hex
         return self._typed("select_project", key=key, project=ref, scope=scope, idempotency_key=key)
@@ -610,6 +644,50 @@ class RemoteShots(_RemoteFamily):
         except WorkspaceClientError as exc: return DomainResult.failure(ErrorObject(exc.code, exc.message, exc.details), idempotency_key=idempotency_key or "")
         key = idempotency_key or uuid.uuid4().hex
         return self._typed("update_project_shot", project, shot_id, key=key, expected_version=version, name=name, metadata=metadata, idempotency_key=key)
+
+    def update_metadata_namespace(
+        self,
+        project,
+        shot_id,
+        namespace: str,
+        values: Mapping[str, Any],
+        *,
+        expected_version: int | None = None,
+        idempotency_key=None,
+    ):
+        """Merge one metadata namespace through the Runtime-owned shot command.
+
+        The read/merge/write is deliberately a thin product adapter: Runtime
+        still validates the version, stores the shot, emits the receipt, and
+        owns item order and primary-candidate promotion. Generic metadata
+        cannot impersonate a domain promotion command.
+        """
+        key = idempotency_key or uuid.uuid4().hex
+        if project is None:
+            return DomainResult.failure(
+                ErrorObject("unsupported_operation", "project-scoped shots are required", {"operation": "update_shot_metadata_namespace"}),
+                idempotency_key=key,
+            )
+        if not isinstance(namespace, str) or not namespace.strip():
+            return DomainResult.failure(ErrorObject("validation_error", "metadata namespace is required", {"field": "namespace"}), idempotency_key=key)
+        if not isinstance(values, Mapping):
+            return DomainResult.failure(ErrorObject("validation_error", "metadata namespace values must be an object", {"field": "values"}), idempotency_key=key)
+        protected = {"primary", "is_primary", "primary_item_id", "candidate_item_id", "promotion"}
+        if any(str(field) in protected for field in values):
+            return DomainResult.failure(ErrorObject("validation_error", "primary promotion is owned by the shot domain command", {"field": "values"}), idempotency_key=key)
+        try:
+            current = self._client.get_project_shot(project, shot_id)
+            version = int(expected_version) if expected_version is not None else int(current.get("version", 1))
+            metadata = dict(current.get("metadata") or {})
+            current_namespace = metadata.get(namespace, {})
+            if current_namespace is None:
+                current_namespace = {}
+            if not isinstance(current_namespace, Mapping):
+                return DomainResult.failure(ErrorObject("validation_error", "existing metadata namespace is not an object", {"namespace": namespace}), idempotency_key=key)
+            metadata[namespace] = {**dict(current_namespace), **dict(values)}
+        except WorkspaceClientError as exc:
+            return DomainResult.failure(ErrorObject(exc.code, exc.message, exc.details), idempotency_key=key)
+        return self._typed("update_project_shot", project, shot_id, key=key, expected_version=version, metadata=metadata, idempotency_key=key)
     def archive(self, project, shot_id, *, expected_version=None, idempotency_key=None):
         if project is None:
             return DomainResult.failure(ErrorObject("unsupported_operation", "project-scoped shots are required", {"operation": "archive_shot"}), idempotency_key=idempotency_key or "")
@@ -722,6 +800,70 @@ class RemoteShots(_RemoteFamily):
     def rebind_text_binding(self, project, binding_id, *, media_id, expected_head, idempotency_key=None):
         key = idempotency_key or uuid.uuid4().hex
         return self._typed("rebind_project_shot_text_binding", project, binding_id, key=key, media_id=media_id, expected_head=expected_head, idempotency_key=key)
+
+
+class RemoteDocuments(_RemoteFamily):
+    """Thin project-document adapter over Runtime's typed document commands."""
+
+    def list(self, project, *, cursor=None, limit=50):
+        return self._typed("list_documents", project, cursor=cursor, limit=limit)
+
+    def show(self, project, document_id):
+        return self._typed("get_document", project, document_id)
+
+    def create(self, *, project: str, document_id: str, kind: str, content: Any, idempotency_key=None):
+        key = idempotency_key or uuid.uuid4().hex
+        if not project:
+            return DomainResult.failure(ErrorObject("validation_error", "document creation requires a project", {}), idempotency_key=key)
+        return self._typed("create_document", project, document_id, kind, content, key=key, idempotency_key=key)
+
+    def _version(self, project, document_id, expected_version):
+        if expected_version is not None:
+            return int(expected_version)
+        current = self._client.get_document(project, document_id)
+        return int(current.get("version", 1))
+
+    def update(self, project, document_id, *, expected_version=None, content=None, kind=None, idempotency_key=None):
+        key = idempotency_key or uuid.uuid4().hex
+        if project is None:
+            return DomainResult.failure(ErrorObject("unsupported_operation", "project-scoped documents are required", {"operation": "update_document"}), idempotency_key=key)
+        try:
+            version = self._version(project, document_id, expected_version)
+        except WorkspaceClientError as exc:
+            return DomainResult.failure(ErrorObject(exc.code, exc.message, exc.details), idempotency_key=key)
+        return self._typed("update_document", project, document_id, key=key, expected_version=version, content=content, kind=kind, idempotency_key=key)
+
+    def update_namespace(
+        self,
+        project,
+        document_id,
+        namespace: str,
+        values: Mapping[str, Any],
+        *,
+        expected_version: int | None = None,
+        idempotency_key=None,
+    ):
+        """Merge one content namespace without flattening sibling document data."""
+        key = idempotency_key or uuid.uuid4().hex
+        if project is None:
+            return DomainResult.failure(ErrorObject("unsupported_operation", "project-scoped documents are required", {"operation": "update_document_namespace"}), idempotency_key=key)
+        if not isinstance(namespace, str) or not namespace.strip():
+            return DomainResult.failure(ErrorObject("validation_error", "document namespace is required", {"field": "namespace"}), idempotency_key=key)
+        if not isinstance(values, Mapping):
+            return DomainResult.failure(ErrorObject("validation_error", "document namespace values must be an object", {"field": "values"}), idempotency_key=key)
+        try:
+            current = self._client.get_document(project, document_id)
+            version = int(expected_version) if expected_version is not None else int(current.get("version", 1))
+            content = dict(current.get("content") or {})
+            current_namespace = content.get(namespace, {})
+            if current_namespace is None:
+                current_namespace = {}
+            if not isinstance(current_namespace, Mapping):
+                return DomainResult.failure(ErrorObject("validation_error", "existing document namespace is not an object", {"namespace": namespace}), idempotency_key=key)
+            content[namespace] = {**dict(current_namespace), **dict(values)}
+        except WorkspaceClientError as exc:
+            return DomainResult.failure(ErrorObject(exc.code, exc.message, exc.details), idempotency_key=key)
+        return self._typed("update_document", project, document_id, key=key, expected_version=version, content=content, idempotency_key=key)
 
 
 class RemoteGenerations(_RemoteFamily):
@@ -918,7 +1060,7 @@ class RemoteAstridClient:
         self._transport = transport
         self.projects, self.timelines, self.media = RemoteProjects(transport), RemoteTimelines(transport), RemoteMedia(transport)
         self.tasks, self.runs, self.references = RemoteTasks(transport), RemoteRuns(transport), RemoteReferences(transport)
-        self.shots, self.generations = RemoteShots(transport), RemoteGenerations(transport)
+        self.shots, self.documents, self.generations = RemoteShots(transport), RemoteDocuments(transport), RemoteGenerations(transport)
     def health(self): return self._transport.health()
     def handshake(self, client_name: str, client_version: str, requested_scopes: list[str]): return self._transport.handshake(client_name, client_version, requested_scopes)
     def doctor(self): return self._transport.doctor()
